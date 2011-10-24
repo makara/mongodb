@@ -1,0 +1,5 @@
+name = MongoDB Cache
+description = Store cache in MongoDB.
+package = MongoDB
+core = 6.x
+dependencies[] = mongodb
