@@ -27,8 +27,8 @@ function cache_get($cid, $bin = 'cache') {
 /**
  * Store data in the persistent cache.
  */
-function cache_set($cid, $data, $bin = 'cache', $expire = CACHE_PERMANENT) {
-  return mongodb_cache_get_object($bin)->set($cid, $data, $expire);
+function cache_set($cid, $data, $bin = 'cache', $expire = CACHE_PERMANENT, $headers = NULL) {
+  return mongodb_cache_get_object($bin)->set($cid, $data, $expire, $headers);
 }
 
 /**
@@ -152,13 +152,14 @@ class DrupalMongoDBCache {
     return $cache;
   }
 
-  function set($cid, $data, $expire = CACHE_PERMANENT) {
+  function set($cid, $data, $expire = CACHE_PERMANENT, $headers = NULL) {
     $scalar = is_scalar($data);
     $entry = array(
       '_id' => (string)$cid,
       'cid' => (string)$cid,
       'created' => $_SERVER['REQUEST_TIME'],
       'expire' => $expire,
+      'headers' => $headers,
       'serialized' => !$scalar,
       'data' => $scalar ? $data : serialize($data),
     );
