@@ -6,7 +6,7 @@
  */
 
 /**
- * Implement hook_field_storage_info().
+ * Implements hook_field_storage_info().
  */
 function mongodb_field_storage_field_storage_info() {
   return array(
@@ -18,37 +18,40 @@ function mongodb_field_storage_field_storage_info() {
 }
 
 /**
- * Implement hook_field_storage_details().
+ * Implements hook_field_storage_details().
  */
 function mongodb_field_storage_field_storage_details($field) {
   // We probably want to implement that at one point, but this is informative only.
 }
 
 /**
- * Implement hook_field_storage_create_field().
+ * Implements hook_field_storage_create_field().
  */
 function mongodb_field_storage_field_storage_create_field($field) {
   // Nothing to do?
 }
 
 /**
- * Implement hook_field_storage_update_field().
+ * Implements hook_field_storage_update_field().
  */
 function mongodb_field_storage_field_storage_update_field($field, $prior_field, $has_data) {
   // Nothing to do?
 }
 
 /**
- * Implement hook_field_storage_delete_field().
+ * Implements hook_field_storage_delete_field().
  */
 function mongodb_field_storage_field_storage_delete_field($field) {
   // Nothing to do?
 }
 
 /**
- * Implement hook_field_storage_load().
+ * Implements hook_field_storage_load().
  */
 function mongodb_field_storage_field_storage_load($entity_type, $entities, $age, $fields, $options) {
+  if (module_exists('mongodb_migrate')) {
+    mongodb_migrate_load_helper($entity_type, $entities, $age, $fields, $options);
+  }
   $load_current = $age == FIELD_LOAD_CURRENT;
 
   // Fetch information about the fields and prepare the keys.
@@ -70,7 +73,12 @@ function mongodb_field_storage_field_storage_load($entity_type, $entities, $age,
   $result = $collection->find(array('_id' => array('$in' => array_keys($keys))));
 
   foreach ($result as $row) {
-    $entity_id = $row['_id'];
+    if ($entity_type == 'node' && isset($row['nid'])) {
+      $entity_id = $row['nid'];
+    }
+    else {
+      $entity_id = $row['_id'];
+    }
     foreach ($saved_fields as $field_id => $field) {
       $field_name = $field['field_name'];
       $field_values = array();
@@ -95,9 +103,12 @@ function mongodb_field_storage_field_storage_load($entity_type, $entities, $age,
 }
 
 /**
- * Implement hook_field_storage_write().
+ * Implements hook_field_storage_write().
  */
 function mongodb_field_storage_field_storage_write($entity_type, $entity, $op, $fields, $entity_write = FALSE) {
+  if (strpos($entity_type, "rules") === 0) {
+    return;
+  }
   $wrote = &drupal_static(__FUNCTION__, array());
   list($entity_id, $revision_id, $bundle) = entity_extract_ids($entity_type, $entity);
   // There is always a field_attach_insert/update call followed by an
@@ -137,7 +148,7 @@ function mongodb_field_storage_field_storage_write($entity_type, $entity, $op, $
     }
   }
 
-  // Add the fieldapi fields to the new object
+  // Add the fieldapi fields to the new object.
   foreach ($fields as $field_id) {
     $field = field_info_field_by_id($field_id);
     $field_name = $field['field_name'];
@@ -145,7 +156,7 @@ function mongodb_field_storage_field_storage_write($entity_type, $entity, $op, $
     if (isset($entity->$field_name)) {
       foreach ($entity->$field_name as $language => $values) {
         // According to field.test, we should not save anything for NULL.
-        if (isset($values[0])) {
+        if (!empty($values[0])) {
           if ($field['cardinality'] == 1) {
             foreach ($values[0] as $column_name => $column_value) {
               if (isset($field['columns'][$column_name])) {
@@ -201,15 +212,27 @@ function mongodb_field_storage_field_storage_write($entity_type, $entity, $op, $
     $new_entity->_id = (int) $revision_id;
     mongodb_collection('fields_revision', $entity_type)->save($new_entity);
   }
+  module_invoke('mongodb_migrate', 'write_helper', $entity_type, $entity_id);
 }
 
+/**
+ * Setting the type of field value.
+ *
+ * @param string $type
+ *   Type of field
+ * @param string $value
+ *   Vaule of field
+ *
+ * @return string
+ *   Returns the value
+ */
 function _mongodb_field_storage_value($type, $value) {
   switch ($type) {
     case 'int':
     case 'serial':
-      return (int) $value;
+      return is_array($value) ? array_map('intval', $value) : intval($value);
     case 'float':
-      return (float) $value;
+      return is_array($value) ? array_map('floatval', $value) : floatval($value);
     default:
       return $value;
   }
@@ -251,18 +274,25 @@ function mongodb_field_storage_field_storage_delete_revision($entity_type, $enti
  * This function simply marks for deletion all data associated with the field.
  */
 function mongodb_field_storage_field_storage_delete_instance($instance) {
-  // TODO: figure out what to do.
+  // @todo: figure out what to do.
 }
 
 class MongodbStorageException extends Exception {}
 
 /**
  * Implements hook_entity_query_alter().
+ *
+ * Alter the entity info.
  */
 function mongodb_field_storage_entity_query_alter($query) {
   $query->executeCallback = 'mongodb_field_storage_query';
 }
 
+/**
+ * Implements hook_field_storage_query().
+ *
+ * Execute an EntityFieldQuery.
+ */
 function mongodb_field_storage_query($query) {
   $find = array();
   if (isset($query->entityConditions['entity_type'])) {
@@ -270,40 +300,75 @@ function mongodb_field_storage_query($query) {
     unset($query->entityConditions['entity_type']);
   }
   else {
+    // It looks like we are performing a 'has_data' query as we aren't being
+    // passed any entity conditions - we try to be sure of this by rebuilding
+    // a has data query and comparing that to our query
     if (count($query->fields) == 1) {
       $field = $query->fields[0];
       $field_has_data_query = new EntityFieldQuery;
+      $column = $values = NULL;
+      $count = TRUE;
+      // We need to ascertain if the query we're being passed is a 'has data'
+      // query that is concerned with listing the allowed values, eg list
+      // module's _list_values_in_use function
+      if (!empty($query->fieldConditions[0]['column'])) {
+        // We are using a field condition, not just a general has data so we
+        // need our has_data query to mimic this by adding a column to the field
+        // condition
+        $column = $query->fieldConditions[0]['column'];
+        $values = $query->fieldConditions[0]['value'];
+        $count = $query->count;
+      }
       $field_has_data_query
-        ->fieldCondition($field)
-        ->range(0, 1)
-        ->count();
+        ->fieldCondition($field, $column, $values)
+        ->range(0, 1);
+      if ($count) {
+        $field_has_data_query->count();
+      }
       $field_has_data_query->executeCallback = 'mongodb_field_storage_query';
       $success = TRUE;
       foreach (get_object_vars($field_has_data_query) as $key => $value) {
-        // we rebuild the has_data query and then compare with the received query structure
-        // but by this point the query is altered so it's alwass failing.
+        // We rebuild the has_data query and then compare with the received
+        // query structure but by this point the query is altered so it's
+        // always failing.
         if ($key != 'altered' && $value != $query->$key) {
           $success = FALSE;
         }
       }
       if ($success) {
-        foreach ($field['bundles'] as $entity_type => $data) {
-          if (mongodb_collection('fields_current', $entity_type)->find()->limit(1)->count(TRUE)) {
-            return TRUE;
+        if (!is_array($field['bundles'])) {
+          // This field not yet attached to any bundles.
+          return FALSE;
+        }
+        if (is_array($field['bundles'])) {
+          foreach ($field['bundles'] as $entity_type => $data) {
+            foreach($data as $bundle_name) {
+              if (mongodb_collection('fields_current', $entity_type)->find(array($field['field_name'] => array('$exists' => TRUE), 'type' => $bundle_name))->limit(1)->count(TRUE)) {
+                return TRUE;
+              }
+            }
           }
         }
         return FALSE;
       }
     }
-    throw new EntityFieldQueryException('No entity_type');
+   // throw new EntityFieldQueryException('No entity_type');
   }
   $entity_map = array('entity_id' => '_id', 'revision_id' => '_revision_id', 'bundle' => '_bundle');
+  $type_map = array('entity_id' => 'int', 'revision_id' => 'int', 'bundle' => 'text');
   foreach ($query->entityConditions as $field => $data) {
-    $value = $field == 'bundle' ? $data['value'] : intval($data['value']);
-    $find[$entity_map[$field]] = _mongodb_field_storage_query_value($value, $data['operator']);
+    $value = $data['value'];
+    $find[$entity_map[$field]] = _mongodb_field_storage_query_value($value, $data['operator'], $type_map[$field]);
   }
   foreach ($query->fieldConditions as $index => $data) {
-    $find[$data['field']['field_name'] . '.' . $data['column']] = _mongodb_field_storage_query_value($data['value'], $data['operator']);
+    $fieldName = $data['field']['field_name'] . '.' . $data['column'];
+    $type = $data['field']['columns'][$data['column']]['type'];
+    if (isset($find[$fieldName])) {
+      $find[$fieldName] = array_merge($find[$fieldName], _mongodb_field_storage_query_value($data['value'], $data['operator'], $type));
+    }
+    else {
+      $find[$data['field']['field_name'] . '.' . $data['column']] = _mongodb_field_storage_query_value($data['value'], $data['operator'], $type);
+    }
     unset($query->fields[$index]);
   }
   /*
@@ -311,66 +376,80 @@ function mongodb_field_storage_query($query) {
     $find[$field['field_name']]['$exists'] = TRUE;
   }
   */
-  foreach ($query->propertyConditions as $data) {
-    $find[$data['column']] = _mongodb_field_storage_query_value($data['value'], $data['operator']);
+  if ($query->propertyConditions) {
+    $entity_info = entity_get_info($entity_type);
+    $table_schema = isset($entity_info['base table']) ? drupal_get_schema($entity_info['base table']) : array();
+    foreach ($query->propertyConditions as $data) {
+      $type = isset($table_schema['fields'][$data['column']]['type']) ? $table_schema['fields'][$data['column']]['type'] : NULL;
+      $find[$data['column']] = _mongodb_field_storage_query_value($data['value'], $data['operator'], $type);
+    }
   }
+
   // unset propertyConditions to please execute()
   unset($query->propertyConditions);
   if ($query->age == FIELD_LOAD_CURRENT) {
-    $collection = mongodb_collection('fields_current', $entity_type);
-    $id_key = '_id';
+    if (isset($entity_type)) {
+      $collection = mongodb_collection('fields_current', $entity_type);
+      $id_key = '_id';
+    }
   }
   else {
     $collection = mongodb_collection('fields_revision', $entity_type);
     $id_key = '_revision_id';
   }
-  $collection = mongodb_collection($query->age == FIELD_LOAD_CURRENT ? 'fields_current' : 'fields_revision', $entity_type);
-  if ($query->count && !$query->range) {
-    return $collection->count($find);
-  }
-  $cursor = $collection->find($find);
-  if (isset($query->hint)) {
-    $cursor->hint($query->hint);
-  }
-  if ($query->range) {
-    $cursor->skip($query->range['start'])->limit($query->range['length']);
-  }
-  if ($query->count) {
-    return $cursor->count(TRUE);
-  }
-  else {
-    $sort = array();
-    foreach ($query->order as $order) {
-      switch ($order['type']) {
-        case 'field':
-          $key = $order['specifier']['field']['field_name'] . '.' . $order['specifier']['column'];
-          break;
-        case 'property':
-          $key = $order['specifier'];
-          break;
-        case 'entity':
-          $key = $entity_map[$order['specifier']];
-          break;
-      }
-      $sort[$key] = $order['direction'] == 'ASC' ? 1 : -1;
+  if (isset($entity_type)) {
+    $collection = mongodb_collection($query->age == FIELD_LOAD_CURRENT ? 'fields_current' : 'fields_revision', $entity_type);
+
+    if ($query->count && !$query->range) {
+      return $collection->count($find);
     }
-    if ($sort) {
-      $cursor->sort($sort);
+    $cursor = $collection->find($find);
+    if (isset($query->hint)) {
+      $cursor->hint($query->hint);
+    }
+    if ($query->range) {
+      $cursor->skip($query->range['start'])->limit($query->range['length']);
+    }
+    if ($query->count) {
+      return $cursor->count(TRUE);
+    }
+    else {
+      $sort = array();
+      foreach ($query->order as $order) {
+        switch ($order['type']) {
+          case 'field':
+            $key = $order['specifier']['field']['field_name'] . '.' . $order['specifier']['column'];
+            break;
+          case 'property':
+            $key = $order['specifier'];
+            break;
+          case 'entity':
+            $key = $entity_map[$order['specifier']];
+            break;
+        }
+        $sort[$key] = $order['direction'] == 'ASC' ? 1 : -1;
+      }
+      if ($sort) {
+        $cursor->sort($sort);
+      }
     }
   }
   $return = array();
-  foreach ($cursor as $row) {
-    $row += array('_revision_id' => NULL);
-    $entity = entity_create_stub_entity($entity_type, array($row['_id'], $row['_revision_id'], $row['_bundle']));
-    $return[$entity_type][$row[$id_key]] = $entity;
+  if (isset($cursor)) {
+    foreach ($cursor as $row) {
+      $row += array('_revision_id' => NULL);
+      $entity = entity_create_stub_entity($entity_type, array($row['_id'], $row['_revision_id'], $row['_bundle']));
+      $return[$entity_type][$row[$id_key]] = $entity;
+    }
   }
   return $return;
 }
 
-function _mongodb_field_storage_query_value($value, $operator) {
+function _mongodb_field_storage_query_value($value, $operator, $type) {
   if (!isset($operator)) {
     $operator = is_array($value) ? 'IN' : '=';
   }
+  $value = _mongodb_field_storage_value($type, $value);
   switch ($operator) {
     case '='           : return $value;
     case 'IN'          : return array('$in' => $value);
@@ -380,16 +459,17 @@ function _mongodb_field_storage_query_value($value, $operator) {
     case '>'           : return array('$gt' => $value);
     case '<='          : return array('$lte' => $value);
     case '>='          : return array('$gte' => $value);
-    case '!='          : return array('$ne' => $value);
+    case '!='          :
+    case '<>'          : return array('$ne' => $value);
     case 'STARTS_WITH' : return new MongoRegex('/^' . $value . '/');
-    case 'CONTAINS'    : return new MongoRegex('/' . $value . '/');
+    case 'CONTAINS'    : return new MongoRegex('/' . $value . '/i');
     case 'BETWEEN'     : return array('$gte' => $value[0], '$lte' => $value[1]);
     default : throw new EntityFieldQueryException("$operator not implemented");
   }
 }
 
 /**
- * Implement hook_field_attach_rename_bundle().
+ * Implements hook_field_attach_rename_bundle().
  */
 function mongodb_field_storage_field_attach_rename_bundle($entity_type, $bundle_old, $bundle_new) {
   mongodb_collection('fields_current', $entity_type)->update(array('_bundle' => $bundle_old), array('_bundle' => $bundle_new), array('multiple' => TRUE));
@@ -421,9 +501,12 @@ function mongodb_field_storage_field_attach_delete($entity_type, $entity) {
   }
 }
 
+/**
+ * Implements hook_entity_info_alter().
+ */
 function mongodb_field_storage_entity_info_alter(&$entity_info) {
   foreach ($entity_info as &$info) {
-#    $info['controller class'] = 'MongoDb' . $info['controller class'];
+    // $info['controller class'] = 'MongoDb' . $info['controller class'];
   }
 }
 
@@ -453,37 +536,47 @@ class MongoDbEntityLoader {
 }
 
 class MongoDbDrupalDefaultEntityController extends DrupalDefaultEntityController {
-  function buildQuery($ids, $conditions = array(), $revision_id) {
+  function buildQuery($ids, $conditions = array(), $revision_id = FALSE) {
     return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
   }
 }
 
-class MongodbCommentController extends CommentController {
-  function buildQuery($ids, $conditions = array(), $revision_id) {
-    return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+if (class_exists('CommentController')) {
+  class MongodbCommentController extends CommentController {
+    function buildQuery($ids, $conditions = array(), $revision_id = FALSE) {
+      return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+    }
   }
 }
 
-class MongoDbNodeController extends NodeController {
-  function buildQuery($ids, $conditions = array(), $revision_id) {
-    return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+if (class_exists('NodeController')) {
+  class MongoDbNodeController extends NodeController {
+    function buildQuery($ids, $conditions = array(), $revision_id = FALSE) {
+      return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+    }
   }
 }
 
-class MongoDbTaxonomyTermController extends TaxonomyTermController {
-  function buildQuery($ids, $conditions = array(), $revision_id) {
-    return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+if (class_exists('TaxonomyTermController')) {
+  class MongoDbTaxonomyTermController extends TaxonomyTermController {
+    function buildQuery($ids, $conditions = array(), $revision_id = FALSE) {
+      return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+    }
   }
 }
 
-class MongoDbTaxonomyVocabularyController extends TaxonomyVocabularyController {
-  function buildQuery($ids, $conditions = array(), $revision_id) {
-    return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+if (class_exists('TaxonomyVocabularyController')) {
+  class MongoDbTaxonomyVocabularyController extends TaxonomyVocabularyController {
+    function buildQuery($ids, $conditions = array(), $revision_id = FALSE) {
+      return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+    }
   }
 }
 
-class MongoDbUserController extends UserController {
-  function buildQuery($ids, $conditions = array(), $revision_id) {
-    return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+if (class_exists('UserController')) {
+  class MongoDbUserController extends UserController {
+    function buildQuery($ids, $conditions = array(), $revision_id = FALSE) {
+      return new MongoDbEntityLoader($this->entityType, $ids, $conditions);
+    }
   }
 }

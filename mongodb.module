@@ -21,17 +21,24 @@ function mongodb_help($path, $arg) {
 function mongodb($alias = 'default') {
   static $mongo_objects;
   $connections = variable_get('mongodb_connections', array());
-  $connections += array('default' => array('host' => 'localhost', 'db' => 'drupal'));
   if (!isset($connections[$alias])) {
     $alias = 'default';
   }
-  $connection = $connections[$alias];
+  $connection = isset($connections[$alias]) ? $connections[$alias] : array();
+  $connection += array('host' => 'localhost', 'db' => 'drupal', 'connection_options' => array());
   $host = $connection['host'];
+  $options = $connection['connection_options'] +  array('connect' => TRUE);
   $db = $connection['db'];
   if (!isset($mongo_objects[$host][$db])) {
-    $mongo = new Mongo($host);
-    $mongo_objects[$host][$db] = $mongo->selectDB($db);
-    $mongo_objects[$host][$db]->connection = $mongo;
+    try {
+      $mongo = new Mongo($host, $options);
+      $mongo_objects[$host][$db] = $mongo->selectDB($db);
+      $mongo_objects[$host][$db]->connection = $mongo;
+    }
+    catch (MongoConnectionException $e) {
+      $mongo_objects[$host][$db] = new mongoDummy;
+      throw $e;
+    }
   }
   return $mongo_objects[$host][$db];
 }
@@ -70,7 +77,7 @@ class mongoDebugCollection {
     debug('find');
     debug($query);
     debug($fields);
-    return mongoDebugCursor($this->collection->find($query, $fields));
+    return new mongoDebugCursor($this->collection->find($query, $fields));
   }
 
   function __call($name, $arguments) {
@@ -89,6 +96,15 @@ class mongoDebugCursor {
     debug($name);
     debug($arguments);
     return call_user_func_array(array($this->collection, $name), $arguments);
+  }
+}
+
+class mongoDummy {
+  public $connection;
+  function selectCollection() {
+    return new mongoDummy;
+  }
+  function __call($name, $arguments) {
   }
 }
 

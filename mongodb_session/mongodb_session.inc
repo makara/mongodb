@@ -1,9 +1,6 @@
 <?php
-
-
 if (!function_exists('_drupal_session_open')) {
-
-include_once dirname(__FILE__) . '/../mongodb.module';
+  include_once dirname(__FILE__) . '/../mongodb.module';
 
 /**
  * @file
@@ -21,6 +18,7 @@ include_once dirname(__FILE__) . '/../mongodb.module';
  * data should instead be accessed via the $_SESSION superglobal.
  */
 
+
 /**
  * Session handler assigned by session_set_save_handler().
  *
@@ -30,7 +28,7 @@ include_once dirname(__FILE__) . '/../mongodb.module';
  *
  * This function should not be called directly.
  *
- * @return
+ * @return boolean
  *   This function will always return TRUE.
  */
 function _drupal_session_open() {
@@ -46,7 +44,7 @@ function _drupal_session_open() {
  *
  * This function should not be called directly.
  *
- * @return
+ * @return boolean
  *   This function will always return TRUE.
  */
 function _drupal_session_close() {
@@ -63,9 +61,10 @@ function _drupal_session_close() {
  * This function should not be called directly. Session data should
  * instead be accessed via the $_SESSION superglobal.
  *
- * @param $sid
+ * @param string $sid
  *   Session ID.
- * @return
+ *
+ * @return array|string
  *   Either an array of the session data, or an empty string, if no data
  *   was found or the user is anonymous.
  */
@@ -102,24 +101,20 @@ function _drupal_session_read($sid) {
   else {
     $session = $collection->findOne(array('sid' => $sid));
   }
+  $collection = mongodb_collection('fields_current', 'user');
+  $user = (object) $collection->findOne(array('_id' => $session['uid']));
 
+  if (!isset($user->uid)) {
+    $user = db_query("SELECT * FROM {users} u WHERE uid = :uid", array(':uid' => $session['uid']))->fetchObject();
+    // Add roles element to $user and insert an entry into fields_current.user
+    // so next time we get it from Mongo.
+    include_once dirname(__FILE__) . '/mongodb_session.module';
+    $user->roles = array();
+    $user->roles = mongodb_session_user_insert(array(), $user);
+  }
   // We found the client's session record and they are an authenticated,
   // active user.
-  if ($session && !empty($session['uid']) && $session['status'] == 1) {
-    $collection = mongodb_collection('fields_current', 'user');
-    $user = (object) $collection->findOne(array('_id' => $session['uid']));
-    // Copy from SQL.
-    if (!isset($user->uid)) {
-      include_once dirname(__FILE__) . '/mongodb_session.module';
-      $user = db_query("SELECT * FROM {users} u WHERE uid = :uid", array(':uid' => $session['uid']))->fetchObject();
-      $user->roles = mongodb_session_user_insert(array(), $user);
-    }
-    // If mongodb_fields_storage wrote this user object, we need to update it.
-    elseif (!isset($user->roles)) {
-      include_once dirname(__FILE__) . '/mongodb_session.module';
-      $user->roles = _mongodb_session_get_roles($user);
-      $collection->update(array('_id' => (int) $user->uid), array('$set' => array('roles' => $user->roles)));
-    }
+  if ($session && !empty($session['uid']) && $user->status == 1) {
     $user->session = $session['session'];
   }
   // We didn't find the client's record (session has expired), or they are
@@ -141,11 +136,12 @@ function _drupal_session_read($sid) {
  * This function should not be called directly. Session data should
  * instead be accessed via the $_SESSION superglobal.
  *
- * @param $sid
+ * @param string $sid
  *   Session ID.
- * @param $value
+ * @param array $value
  *   Serialized array of the session data.
- * @return
+ *
+ * @return boolean
  *   This function will always return TRUE.
  */
 function _drupal_session_write($sid, $value) {
@@ -157,8 +153,8 @@ function _drupal_session_write($sid, $value) {
   }
 
   $fields = array(
-    'uid' => (int)$user->uid,
-    'cache' => isset($user->cache) ? (int)$user->cache : 0,
+    'uid' => (int) $user->uid,
+    'cache' => isset($user->cache) ? (int) $user->cache : 0,
     'hostname' => ip_address(),
     'session' => $value,
     'timestamp' => REQUEST_TIME,
@@ -177,6 +173,9 @@ function _drupal_session_write($sid, $value) {
       unset($key['sid']);
     }
   }
+  elseif (variable_get('https', FALSE)) {
+    unset($key['ssid']);
+  }
 
   $collection = mongodb_collection(variable_get('mongodb_session', 'session'));
   $collection
@@ -186,7 +185,7 @@ function _drupal_session_write($sid, $value) {
   // This reduces contention in the users table.
   if ($user->uid && REQUEST_TIME - $user->access > variable_get('session_write_interval', 180)) {
     $fields = array(
-      'access' => REQUEST_TIME
+      'access' => REQUEST_TIME,
     );
     // Update SQL because user_load() falls back to that.
     db_update('users')
@@ -208,7 +207,7 @@ function _drupal_session_write($sid, $value) {
  * Initialize the session handler, starting a session if needed.
  */
 function drupal_session_initialize() {
-  global $user;
+  global $user, $is_https;
 
   session_set_save_handler('_drupal_session_open', '_drupal_session_close', '_drupal_session_read', '_drupal_session_write', '_drupal_session_destroy', '_drupal_session_garbage_collection');
 
@@ -227,9 +226,19 @@ function drupal_session_initialize() {
     // we lazyly start sessions at the end of this request, and some
     // processes (like drupal_get_token()) needs to know the future
     // session ID in advance.
+    $GLOBALS['lazy_session'] = TRUE;
     $user = drupal_anonymous_user();
+    // Less random sessions (which are much faster to generate) are used for
+    // anonymous users than are generated in drupal_session_regenerate() when
+    // a user becomes authenticated.
     session_id(md5(uniqid('', TRUE)));
+    if ($is_https && variable_get('https', FALSE)) {
+      $insecure_session_name = substr(session_name(), 1);
+      $session_id = drupal_hash_base64(uniqid(mt_rand(), TRUE));
+      $_COOKIE[$insecure_session_name] = $session_id;
+    }
   }
+  date_default_timezone_set(drupal_get_user_timezone());
 }
 
 /**
@@ -258,7 +267,7 @@ function drupal_session_start() {
  * If an anonymous user already have an empty session, destroy it.
  */
 function drupal_session_commit() {
-  global $user;
+  global $user, $is_https;
 
   if (!drupal_save_session()) {
     // We don't have anything to do if we are not allowed to save the session.
@@ -277,6 +286,12 @@ function drupal_session_commit() {
     // started.
     if (!drupal_session_started()) {
       drupal_session_start();
+      if ($is_https && variable_get('https', FALSE)) {
+        $insecure_session_name = substr(session_name(), 1);
+        $params = session_get_cookie_params();
+        $expire = $params['lifetime'] ? REQUEST_TIME + $params['lifetime'] : 0;
+        setcookie($insecure_session_name, $_COOKIE[$insecure_session_name], $expire, $params['path'], $params['domain'], FALSE, $params['httponly']);
+      }
     }
     // Write the session data.
     session_write_close();
@@ -303,9 +318,16 @@ function drupal_session_regenerate() {
   global $user, $is_https;
   if ($is_https && variable_get('https', FALSE)) {
     $insecure_session_name = substr(session_name(), 1);
+    if (!isset($GLOBALS['lazy_session']) && isset($_COOKIE[$insecure_session_name])) {
+      $old_insecure_session_id = $_COOKIE[$insecure_session_name];
+    }
     $params = session_get_cookie_params();
-    $session_id = md5(uniqid(mt_rand(), TRUE));
-    setcookie($insecure_session_name, $session_id, REQUEST_TIME + $params['lifetime'], $params['path'], $params['domain'], FALSE, $params['httponly']);
+    $session_id = drupal_hash_base64(uniqid(mt_rand(), TRUE) . drupal_random_bytes(55));
+    // If a session cookie lifetime is set, the session will expire
+    // $params['lifetime'] seconds from the current request. If it is not set,
+    // it will expire when the browser is closed.
+    $expire = $params['lifetime'] ? REQUEST_TIME + $params['lifetime'] : 0;
+    setcookie($insecure_session_name, $session_id, $expire, $params['path'], $params['domain'], FALSE, $params['httponly']);
     $_COOKIE[$insecure_session_name] = $session_id;
   }
 
@@ -321,7 +343,9 @@ function drupal_session_regenerate() {
     drupal_session_start();
     $user = $account;
   }
-
+  if (isset($user->timezone)) {
+    date_default_timezone_set(drupal_get_user_timezone());
+  }
   if (isset($old_session_id)) {
     $field = $is_https ? 'ssid' : 'sid';
     mongodb_collection(variable_get('mongodb_session', 'session'))
@@ -352,22 +376,29 @@ function _drupal_session_destroy($sid) {
   // Unset the session cookies.
   _drupal_session_delete_cookie(session_name());
   if ($is_https) {
-    _drupal_session_delete_cookie(substr(session_name(), 1), TRUE);
+    _drupal_session_delete_cookie(substr(session_name(), 1), FALSE);
+  }
+  elseif (variable_get('https', FALSE)) {
+    _drupal_session_delete_cookie('S' . session_name(), TRUE);
   }
 }
 
 /**
  * Deletes the session cookie.
  *
- * @param $name
+ * @param sting $name
  *   Name of session cookie to delete.
- * @param $force_insecure
- *   Fornce cookie to be insecure.
+ * @param boolean $secure
+ *   Force the secure value of the cookie.
  */
-function _drupal_session_delete_cookie($name, $force_insecure = FALSE) {
-  if (isset($_COOKIE[$name])) {
+function _drupal_session_delete_cookie($name, $secure = NULL) {
+  global $is_https;
+  if (isset($_COOKIE[$name]) || (!$is_https && $secure === TRUE)) {
     $params = session_get_cookie_params();
-    setcookie($name, '', REQUEST_TIME - 3600, $params['path'], $params['domain'], !$force_insecure && $params['secure'], $params['httponly']);
+    if ($secure !== NULL) {
+      $params['secure'] = $secure;
+    }
+    setcookie($name, '', REQUEST_TIME - 3600, $params['path'], $params['domain'], $params['secure'], $params['httponly']);
     unset($_COOKIE[$name]);
   }
 }
@@ -411,10 +442,11 @@ function _drupal_session_garbage_collection($lifetime) {
  * dangerous operations, such as manipulating the global $user object.
  * See http://drupal.org/node/218104 for usage.
  *
- * @param $status
+ * @param boolean $status
  *   Disables writing of session data when FALSE, (re-)enables
  *   writing when TRUE.
- * @return
+ *
+ * @return boolean
  *   FALSE if writing session data has been disabled. Otherwise, TRUE.
  */
 function drupal_save_session($status = NULL) {

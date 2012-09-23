@@ -7,12 +7,8 @@
  * Resembles very closely the core block module but without an UI.
  */
 
-if (!defined('BLOCK_REGION_NONE')) {
-  /**
-  * Denotes that a block is not enabled in any region and should not be shown.
-  */
-  define('BLOCK_REGION_NONE', -1);
-}
+// Denotes that a block is not enabled in any region and should not be shown.
+define('MONGODB_BLOCK_REGION_NONE', -1);
 
 /**
  * Implements hook_menu().
@@ -96,12 +92,19 @@ function mongodb_block_page_build(&$page) {
   }
 }
 
+/**
+ * Render the content and subject for a set of blocks.
+ *
+ * @param array $blocks_result
+ *   An array of block objects such as returned for one region by
+ *   _block_load_blocks()
+ */
 function mongodb_block_render_blocks($blocks_result) {
   $return = array();
   foreach ($blocks_result as $block) {
     // Copy module and delta out of the _id.
     $block += $block['_id'];
-    $block = (object)$block;
+    $block = (object) $block;
     // Render the block content if it has not been created already.
     if (!isset($block->content)) {
       // Try fetching the block from cache. Block caching is not compatible
@@ -161,8 +164,10 @@ function mongodb_block_render_blocks($blocks_result) {
  *
  * Theme and language contexts are automatically differentiated.
  *
- * @param $block
- * @return
+ * @param object $block
+ *   The block object.
+ *
+ * @return string
  *   The string used as cache_id for the block.
  */
 function mongodb_block_get_cache_id($block) {
@@ -187,18 +192,36 @@ function mongodb_block_get_cache_id($block) {
   }
 }
 
+/**
+ * Gets an array of blocks suitable for drupal_render().
+ *
+ * @param array $region_blocks
+ *   A list of blocks.
+ */
 function mongodb_block_get_renderable_array($region_blocks) {
+  global $theme;
+
   $weight = 0;
   $build = array();
   foreach ($region_blocks as $key => $block) {
     $build[$key] = $block->content;
     unset($block->content);
 
+    // Add contextual links for this block; skip the main content block, since
+    // contextual links are basically output as tabs/local tasks already. Also
+    // skip the help block, since we assume that most users do not need or want
+    // to perform contextual actions on the help block, and the links needlessly
+    // draw attention on it.
+    // @see _block_get_renderable_array();
+    if (module_exists('mongodb_block_ui') && $key != 'system_main' && $key != 'system_help') {
+      $build[$key]['#contextual_links']['mongodb_block_ui'] = array('admin/structure/mongodb_block/manage', array($theme, $block->module, $block->delta));
+    }
+
     $build[$key] += array(
       '#block' => $block,
       '#weight' => ++$weight,
     );
-    $build[$key]['#theme_wrappers'][] ='block';
+    $build[$key]['#theme_wrappers'][] = 'block';
   }
   $build['#sorted'] = TRUE;
   return $build;
@@ -208,18 +231,30 @@ function mongodb_block_get_renderable_array($region_blocks) {
  * Implements hook_mongodb_block_info_alter().
  */
 function mongodb_block_mongodb_block_info_alter(&$blocks) {
-  // Enable the main content block.
-  $blocks['system_main']['region'] = 'content';
-  $blocks['system_main']['weight'] = 0;
-  $blocks['system_main']['status'] = 1;
+  // Enable the main content block if it is not already enabled.
+  if (empty($blocks['system_main']['status'])) {
+    $blocks['system_main']['region'] = 'content';
+    $blocks['system_main']['weight'] = 0;
+    $blocks['system_main']['status'] = 1;
+  }
 }
 
+/**
+ *  Run _mongodb_block_rehash and go to admin/structure.
+ */
 function mongodb_block_rehash() {
   _mongodb_block_rehash(variable_get('theme_default', 'garland'));
   drupal_set_message('Blocks rebuild done.');
   drupal_goto('admin/structure');
 }
 
+/**
+ *  Updates the block collection with the blocks currently exported by modules.
+ *
+ *  @param string $theme
+ *   The theme to rehash blocks for. If not provided, defaults to the
+ *   currently used theme.
+ */
 function _mongodb_block_rehash($theme) {
   $collection = mongodb_collection('block', $theme);
   $regions = system_region_list($theme);
@@ -237,12 +272,12 @@ function _mongodb_block_rehash($theme) {
           'pages' => array('%'),
           'pages_exclude' => array(),
           'status' => 0,
-          'region' => BLOCK_REGION_NONE,
+          'region' => MONGODB_BLOCK_REGION_NONE,
         );
-        if (isset($block['node_type'])) {
+        if (isset($block['node_type']) && $block['pages'] == array('%')) {
           $block['pages'] = array('node/%');
         }
-        else {
+        else if (!isset($block['node_type'])) {
           $block['node_type']  = array('*');
         }
         $blocks[$module . '_' . $delta] = $block;
@@ -252,9 +287,9 @@ function _mongodb_block_rehash($theme) {
   drupal_alter('mongodb_block_info', $blocks, $theme);
   // Only store the block in the mongodb, if the status is enabled.
   foreach ($blocks as $key => $block) {
-    if ($block['region'] != BLOCK_REGION_NONE && !isset($regions[$block['region']])) {
+    if ($block['region'] != MONGODB_BLOCK_REGION_NONE && !isset($regions[$block['region']])) {
       $blocks[$key]['status'] = 0;
-      $blocks[$key]['region'] = BLOCK_REGION_NONE;
+      $blocks[$key]['region'] = MONGODB_BLOCK_REGION_NONE;
       $block = $blocks[$key];
     }
     if ($block['status']) {
@@ -266,6 +301,14 @@ function _mongodb_block_rehash($theme) {
   return $blocks;
 }
 
+/**
+ * Unset block data and save the block collection.
+ *
+ *  @param object $collection
+ *   MongoDB collection to use
+ *  @param array $block
+ *   The block array
+ */
 function mongodb_block_save_block($collection, $block) {
   unset($block['module'], $block['delta'], $block['status']);
   $collection->save($block);
